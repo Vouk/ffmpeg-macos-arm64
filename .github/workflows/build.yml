@@ -1,0 +1,223 @@
+name: Build FFmpeg
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly: Monday 06:00 UTC
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      ffmpeg_version:
+        description: "FFmpeg git tag to build (e.g. n8.1.1)"
+        required: false
+        default: "n8.1.1"
+
+env:
+  DEFAULT_FFMPEG_VERSION: "n8.1.1"
+
+jobs:
+  build:
+    runs-on: macos-14  # Apple Silicon (M1) runner
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [lgpl, gpl]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine FFmpeg version
+        id: version
+        run: |
+          VERSION="${{ github.event.inputs.ffmpeg_version || env.DEFAULT_FFMPEG_VERSION }}"
+          echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
+          # Strip leading 'n' for display version
+          echo "display=${VERSION#n}" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies (Homebrew)
+        run: |
+          brew update
+          brew install nasm pkg-config
+
+      - name: Install LGPL dependencies
+        run: |
+          brew install dav1d libvpx opus svt-av1
+
+      - name: Install GPL dependencies
+        if: matrix.variant == 'gpl'
+        run: |
+          brew install x264 x265
+
+      - name: Clone FFmpeg
+        run: |
+          git clone --depth=1 --branch "${{ steps.version.outputs.tag }}" \
+            https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+
+      - name: Configure FFmpeg (LGPL)
+        if: matrix.variant == 'lgpl'
+        working-directory: ffmpeg-src
+        run: |
+          ./configure \
+            --prefix="$GITHUB_WORKSPACE/install" \
+            --arch=arm64 \
+            --enable-shared \
+            --disable-static \
+            --disable-programs \
+            --disable-doc \
+            --enable-libdav1d \
+            --enable-libvpx \
+            --enable-libopus \
+            --enable-libsvtav1 \
+            --extra-cflags="-I$(brew --prefix)/include" \
+            --extra-ldflags="-L$(brew --prefix)/lib"
+
+      - name: Configure FFmpeg (GPL)
+        if: matrix.variant == 'gpl'
+        working-directory: ffmpeg-src
+        run: |
+          ./configure \
+            --prefix="$GITHUB_WORKSPACE/install" \
+            --arch=arm64 \
+            --enable-shared \
+            --disable-static \
+            --disable-programs \
+            --disable-doc \
+            --enable-gpl \
+            --enable-libdav1d \
+            --enable-libvpx \
+            --enable-libopus \
+            --enable-libsvtav1 \
+            --enable-libx264 \
+            --enable-libx265 \
+            --extra-cflags="-I$(brew --prefix)/include" \
+            --extra-ldflags="-L$(brew --prefix)/lib"
+
+      - name: Build FFmpeg
+        working-directory: ffmpeg-src
+        run: make -j$(sysctl -n hw.ncpu)
+
+      - name: Install FFmpeg
+        working-directory: ffmpeg-src
+        run: make install
+
+      - name: Fix dylib install names
+        run: |
+          cd "$GITHUB_WORKSPACE/install/lib"
+
+          # Collect all our dylibs
+          DYLIBS=($(ls -1 *.dylib | grep -v '^lib.*\.[0-9]*\.[0-9]*\.[0-9]*\.dylib$' | sort -u))
+
+          echo "Fixing install names for: ${DYLIBS[*]}"
+
+          for dylib in "${DYLIBS[@]}"; do
+            # Change the install name to use @rpath
+            install_name_tool -id "@rpath/$dylib" "$dylib" 2>/dev/null || true
+
+            # Fix references to other FFmpeg dylibs
+            for ref in "${DYLIBS[@]}"; do
+              OLD_PATH=$(otool -L "$dylib" | grep "$ref" | grep -v "^$dylib" | awk '{print $1}' | head -1)
+              if [[ -n "$OLD_PATH" && "$OLD_PATH" != "@rpath/$ref" ]]; then
+                install_name_tool -change "$OLD_PATH" "@rpath/$ref" "$dylib" 2>/dev/null || true
+              fi
+            done
+          done
+
+          echo "=== Verify install names ==="
+          for dylib in "${DYLIBS[@]}"; do
+            echo "--- $dylib ---"
+            otool -L "$dylib" | head -10
+          done
+
+      - name: Prepare package
+        id: package
+        run: |
+          VERSION="${{ steps.version.outputs.display }}"
+          VARIANT="${{ matrix.variant }}"
+          PKG_NAME="ffmpeg-${VERSION}-macos-arm64-${VARIANT}"
+
+          mkdir -p "pkg/${PKG_NAME}/lib"
+          mkdir -p "pkg/${PKG_NAME}/include"
+
+          # Copy dylibs (versioned + symlinks)
+          cp -a install/lib/*.dylib "pkg/${PKG_NAME}/lib/"
+
+          # Copy headers
+          cp -a install/include/* "pkg/${PKG_NAME}/include/"
+
+          # Copy licence
+          if [[ "$VARIANT" == "gpl" ]]; then
+            cp ffmpeg-src/COPYING.GPLv2 "pkg/${PKG_NAME}/LICENSE.txt"
+          else
+            cp ffmpeg-src/COPYING.LGPLv2.1 "pkg/${PKG_NAME}/LICENSE.txt"
+          fi
+
+          # Copy install script
+          cp install.sh "pkg/${PKG_NAME}/"
+          chmod +x "pkg/${PKG_NAME}/install.sh"
+
+          # Create tarball
+          cd pkg
+          tar -cJf "${PKG_NAME}.tar.xz" "${PKG_NAME}"
+
+          echo "archive=${PKG_NAME}.tar.xz" >> "$GITHUB_OUTPUT"
+          echo "pkg_name=${PKG_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.pkg_name }}
+          path: pkg/${{ steps.package.outputs.archive }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Determine version
+        id: version
+        run: |
+          VERSION="${{ github.event.inputs.ffmpeg_version || 'n8.1.1' }}"
+          echo "tag=${VERSION#n}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect archives
+        run: |
+          mkdir -p release
+          find artifacts -name "*.tar.xz" -exec cp {} release/ \;
+          ls -la release/
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.tag }}
+          name: FFmpeg ${{ steps.version.outputs.tag }} macOS ARM64
+          body: |
+            Shared library (dylib) builds of FFmpeg ${{ steps.version.outputs.tag }} for macOS Apple Silicon (arm64).
+
+            ## Variants
+
+            - **LGPL**: `libdav1d`, `libvpx`, `opus`, `svt-av1`
+            - **GPL**: All of LGPL + `x264`, `x265`
+
+            ## Included dylibs
+
+            - `libavutil.60.dylib`
+            - `libavcodec.62.dylib`
+            - `libavformat.62.dylib`
+            - `libswscale.9.dylib`
+            - `libswresample.6.dylib`
+
+            Install names are set to `@rpath/<lib>` for easy bundling.
+          files: release/*
+          draft: false
+          prerelease: false
+          make_latest: true
