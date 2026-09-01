@@ -32,6 +32,71 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Preflight - require signing & notarization secrets
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+        run: |
+          # Signing + notarization + stapling are MANDATORY. Fail fast (before
+          # the long build) with a precise list of anything that is missing.
+          MISSING=()
+
+          # --- Certificate (required to sign dylibs + pkg) ---
+          [[ -z "${MACOS_CERT_P12_BASE64:-}" ]] && MISSING+=("MACOS_CERT_P12_BASE64 (base64 of .p12 with Developer ID Application + Installer certs)")
+          [[ -z "${MACOS_CERT_PASSWORD:-}" ]]   && MISSING+=("MACOS_CERT_PASSWORD (password for the .p12)")
+
+          # --- Notarization credentials: API key OR Apple ID (one complete set) ---
+          HAVE_API_KEY=false
+          if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" && -n "${APPLE_API_KEY_BASE64:-}" ]]; then
+            HAVE_API_KEY=true
+          fi
+          HAVE_APPLE_ID=false
+          if [[ -n "${APPLE_ID:-}" && -n "${APPLE_ID_PASSWORD:-}" ]]; then
+            HAVE_APPLE_ID=true
+          fi
+
+          if [[ "$HAVE_API_KEY" == "false" && "$HAVE_APPLE_ID" == "false" ]]; then
+            MISSING+=("notarization credentials - provide EITHER the App Store Connect API key set (APPLE_API_KEY_ID + APPLE_API_ISSUER_ID + APPLE_API_KEY_BASE64) OR the Apple ID set (APPLE_ID + APPLE_ID_PASSWORD)")
+            # Surface partially-configured sets so the user knows what to complete.
+            if [[ -n "${APPLE_API_KEY_ID:-}${APPLE_API_ISSUER_ID:-}${APPLE_API_KEY_BASE64:-}" ]]; then
+              [[ -z "${APPLE_API_KEY_ID:-}" ]]     && MISSING+=("  -> APPLE_API_KEY_ID (part of the incomplete API key set)")
+              [[ -z "${APPLE_API_ISSUER_ID:-}" ]]  && MISSING+=("  -> APPLE_API_ISSUER_ID (part of the incomplete API key set)")
+              [[ -z "${APPLE_API_KEY_BASE64:-}" ]] && MISSING+=("  -> APPLE_API_KEY_BASE64 (part of the incomplete API key set)")
+            fi
+            if [[ -n "${APPLE_ID:-}${APPLE_ID_PASSWORD:-}" ]]; then
+              [[ -z "${APPLE_ID:-}" ]]          && MISSING+=("  -> APPLE_ID (part of the incomplete Apple ID set)")
+              [[ -z "${APPLE_ID_PASSWORD:-}" ]] && MISSING+=("  -> APPLE_ID_PASSWORD (part of the incomplete Apple ID set)")
+            fi
+          fi
+
+          if [[ ${#MISSING[@]} -gt 0 ]]; then
+            {
+              echo "## Signing & notarization is mandatory but not configured"
+              echo ""
+              echo "The following required repository secrets are missing:"
+              echo ""
+              for m in "${MISSING[@]}"; do echo "- $m"; done
+              echo ""
+              echo "Add them under Settings > Secrets and variables > Actions, then re-run."
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+
+            echo "::error title=Missing signing/notarization secrets::${#MISSING[@]} required secret(s) missing - see the job summary and log."
+            for m in "${MISSING[@]}"; do echo "::error::missing: $m"; done
+            exit 1
+          fi
+
+          echo "All required signing & notarization secrets are present."
+          if [[ "$HAVE_API_KEY" == "true" ]]; then
+            echo "Notarization method: App Store Connect API key."
+          else
+            echo "Notarization method: Apple ID + app-specific password."
+          fi
+
       - name: Determine FFmpeg version
         id: version
         run: |
@@ -193,10 +258,11 @@ jobs:
           MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
         run: |
+          # Certificate presence is already guaranteed by the preflight step;
+          # this is a defensive re-check so signing can never be skipped.
           if [[ -z "${MACOS_CERT_P12_BASE64:-}" || -z "${MACOS_CERT_PASSWORD:-}" ]]; then
-            echo "No signing certificate secrets present; will produce an UNSIGNED pkg."
-            echo "signed=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "::error::Signing certificate secrets are missing. Signing is mandatory; aborting."
+            exit 1
           fi
 
           KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
@@ -238,14 +304,12 @@ jobs:
           echo "Found Installer identity:   $INSTALLER_ID"
           echo "Team ID: $TEAM_ID"
 
-          echo "signed=true" >> "$GITHUB_OUTPUT"
           echo "keychain=$KEYCHAIN_PATH" >> "$GITHUB_OUTPUT"
           echo "app_identity=$APP_ID" >> "$GITHUB_OUTPUT"
           echo "installer_identity=$INSTALLER_ID" >> "$GITHUB_OUTPUT"
           echo "team_id=$TEAM_ID" >> "$GITHUB_OUTPUT"
 
       - name: Sign dylibs
-        if: steps.signing.outputs.signed == 'true'
         run: |
           APP_ID="${{ steps.signing.outputs.app_identity }}"
           LIB_DIR="${{ steps.stage.outputs.root }}${INSTALL_PREFIX}/lib"
@@ -257,10 +321,14 @@ jobs:
               --sign "$APP_ID" "$dylib"
           done
 
+          # Verification is mandatory: fail the build if any dylib is not correctly signed.
           echo "=== Verify dylib signatures ==="
           for dylib in "$LIB_DIR"/*.dylib; do
             [[ -L "$dylib" ]] && continue
-            codesign --verify --strict --verbose=2 "$dylib" 2>&1 | tail -2 || true
+            if ! codesign --verify --strict --verbose=2 "$dylib"; then
+              echo "::error::Signature verification failed for $dylib"
+              exit 1
+            fi
           done
 
       - name: Build installer package
@@ -288,14 +356,15 @@ jobs:
             --package "out/${PKG_NAME}-component.pkg" \
             "out/${PKG_NAME}-unsigned.pkg"
 
-          if [[ "${{ steps.signing.outputs.signed }}" == "true" ]]; then
-            productsign --sign "${{ steps.signing.outputs.installer_identity }}" \
-              "out/${PKG_NAME}-unsigned.pkg" "out/${PKG_NAME}.pkg"
-            echo "=== Verify pkg signature ==="
-            pkgutil --check-signature "out/${PKG_NAME}.pkg" || true
-          else
-            cp "out/${PKG_NAME}-unsigned.pkg" "out/${PKG_NAME}.pkg"
-            echo "Produced UNSIGNED pkg (no signing secrets)."
+          # Signing the installer is mandatory.
+          productsign --sign "${{ steps.signing.outputs.installer_identity }}" \
+            "out/${PKG_NAME}-unsigned.pkg" "out/${PKG_NAME}.pkg"
+
+          # Verify the pkg is actually signed; fail otherwise.
+          echo "=== Verify pkg signature ==="
+          if ! pkgutil --check-signature "out/${PKG_NAME}.pkg"; then
+            echo "::error::pkg signature verification failed for out/${PKG_NAME}.pkg"
+            exit 1
           fi
 
           rm -f "out/${PKG_NAME}-component.pkg" "out/${PKG_NAME}-unsigned.pkg"
@@ -303,7 +372,6 @@ jobs:
 
       - name: Notarize and staple
         id: notarize
-        if: steps.signing.outputs.signed == 'true'
         env:
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
@@ -314,40 +382,71 @@ jobs:
           PKG_PATH="${{ steps.build_pkg.outputs.pkg_path }}"
           TEAM_ID="${{ steps.signing.outputs.team_id }}"
 
-          # Prefer App Store Connect API key auth; fall back to Apple ID.
+          # Build the notarytool auth args. Presence of one complete set is
+          # guaranteed by preflight; API key is preferred.
+          NOTARY_ARGS=()
+          KEY_PATH=""
           if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" && -n "${APPLE_API_KEY_BASE64:-}" ]]; then
             echo "Notarizing with App Store Connect API key..."
             KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
             echo "$APPLE_API_KEY_BASE64" | base64 --decode > "$KEY_PATH"
-            xcrun notarytool submit "$PKG_PATH" \
-              --key "$KEY_PATH" \
-              --key-id "$APPLE_API_KEY_ID" \
-              --issuer "$APPLE_API_ISSUER_ID" \
-              --wait
-            rm -f "$KEY_PATH"
-          elif [[ -n "${APPLE_ID:-}" && -n "${APPLE_ID_PASSWORD:-}" ]]; then
-            echo "Notarizing with Apple ID + app-specific password..."
-            xcrun notarytool submit "$PKG_PATH" \
-              --apple-id "$APPLE_ID" \
-              --password "$APPLE_ID_PASSWORD" \
-              --team-id "$TEAM_ID" \
-              --wait
+            NOTARY_ARGS=(--key "$KEY_PATH" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID")
           else
-            echo "::warning::pkg is signed but no notarization credentials were provided; skipping notarization and stapling."
-            exit 0
+            echo "Notarizing with Apple ID + app-specific password..."
+            NOTARY_ARGS=(--apple-id "$APPLE_ID" --password "$APPLE_ID_PASSWORD" --team-id "$TEAM_ID")
           fi
 
-          # Staple the notarization ticket into the pkg.
-          xcrun stapler staple "$PKG_PATH"
-          xcrun stapler validate "$PKG_PATH"
+          # Submit and wait. Capture the submission id and final status, because
+          # `notarytool submit --wait` exits 0 even when the result is Invalid.
+          SUBMIT_JSON="$RUNNER_TEMP/notary-submit.json"
+          set +e
+          xcrun notarytool submit "$PKG_PATH" "${NOTARY_ARGS[@]}" \
+            --wait --output-format json | tee "$SUBMIT_JSON"
+          SUBMIT_RC=${PIPESTATUS[0]}
+          set -e
 
-          # Gatekeeper smoke test for installer packages.
-          spctl --assess --type install --verbose=2 "$PKG_PATH" || true
+          SUBMISSION_ID="$(/usr/bin/plutil -extract id raw -o - "$SUBMIT_JSON" 2>/dev/null || python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("id",""))' "$SUBMIT_JSON" 2>/dev/null || echo "")"
+          STATUS="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("status",""))' "$SUBMIT_JSON" 2>/dev/null || echo "")"
+          echo "notarytool submit rc=$SUBMIT_RC id=$SUBMISSION_ID status=$STATUS"
+
+          if [[ "$STATUS" != "Accepted" ]]; then
+            echo "::error title=Notarization failed::status='$STATUS' (submission $SUBMISSION_ID)"
+            # Pull the detailed notary log to explain WHY it was rejected.
+            if [[ -n "$SUBMISSION_ID" ]]; then
+              echo "=== notarytool log ==="
+              xcrun notarytool log "$SUBMISSION_ID" "${NOTARY_ARGS[@]}" || true
+            fi
+            [[ -n "$KEY_PATH" ]] && rm -f "$KEY_PATH"
+            exit 1
+          fi
+
+          [[ -n "$KEY_PATH" ]] && rm -f "$KEY_PATH"
+
+          # Stapling is mandatory: the ticket must be embedded so offline installs
+          # (and machines that can't reach Apple) are trusted.
+          if ! xcrun stapler staple "$PKG_PATH"; then
+            echo "::error::Stapling failed for $PKG_PATH"
+            exit 1
+          fi
+          if ! xcrun stapler validate "$PKG_PATH"; then
+            echo "::error::Staple validation failed for $PKG_PATH"
+            exit 1
+          fi
+
+          # Gatekeeper acceptance is mandatory for installer packages.
+          if ! spctl --assess --type install --verbose=2 "$PKG_PATH"; then
+            echo "::error::Gatekeeper (spctl) rejected the installer package $PKG_PATH"
+            exit 1
+          fi
+
+          echo "Notarized, stapled, and Gatekeeper-approved: $PKG_PATH"
 
       - name: Clean up keychain
-        if: always() && steps.signing.outputs.signed == 'true'
+        if: always()
         run: |
-          security delete-keychain "${{ steps.signing.outputs.keychain }}" 2>/dev/null || true
+          if [[ -n "${{ steps.signing.outputs.keychain }}" ]]; then
+            security delete-keychain "${{ steps.signing.outputs.keychain }}" 2>/dev/null || true
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -405,9 +504,9 @@ jobs:
             - `libswscale.9.dylib`
             - `libswresample.6.dylib`
 
-            Dylib install names are set to `/usr/local/lib/<lib>`. Packages are
-            code-signed (Developer ID) and notarized when signing secrets are
-            configured on the repository.
+            Dylib install names are set to `/usr/local/lib/<lib>`. Every package
+            is code-signed (Developer ID), notarized by Apple, and stapled, so it
+            installs without Gatekeeper warnings.
           files: release/*
           draft: false
           prerelease: false

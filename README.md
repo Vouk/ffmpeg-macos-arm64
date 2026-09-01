@@ -16,9 +16,8 @@ Each release contains:
 | `ffmpeg-<version>-macos-arm64-lgpl.pkg` | LGPL build (no x264, x265, fdk-aac) |
 | `ffmpeg-<version>-macos-arm64-gpl.pkg`  | GPL build (includes x264, x265) |
 
-Packages are signed with a Developer ID Installer certificate and notarized +
-stapled by Apple (when signing secrets are configured on the repository), so
-they install without Gatekeeper warnings.
+Every package is signed with a Developer ID Installer certificate and notarized
++ stapled by Apple, so it installs without Gatekeeper warnings.
 
 ### Included Libraries
 
@@ -42,9 +41,11 @@ the desired FFmpeg git tag (e.g. `n8.1.1`, `n8.0.1`).
 
 ## Signing & Notarization Setup
 
-To produce signed and notarized packages, configure these repository secrets
-(Settings > Secrets and variables > Actions). If they are absent, the workflow
-still builds an **unsigned** `.pkg` so forks and PRs keep working.
+Signing, notarization, and stapling are **mandatory**. Configure these
+repository secrets (Settings > Secrets and variables > Actions). If any are
+missing, a preflight step **fails the build early** and lists exactly which
+secret(s) to add - the workflow never produces an unsigned or un-notarized
+package.
 
 ### Certificate (required for signing)
 
