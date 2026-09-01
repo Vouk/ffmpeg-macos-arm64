@@ -15,6 +15,10 @@ on:
 
 env:
   DEFAULT_FFMPEG_VERSION: "n8.1.1"
+  # Install prefix baked into the pkg payload. Dylibs land in ${INSTALL_PREFIX}/lib.
+  INSTALL_PREFIX: "/usr/local"
+  # Reverse-DNS identifier prefix for the installer packages.
+  PKG_IDENTIFIER_PREFIX: "org.ffmpeg.macos.arm64"
 
 jobs:
   build:
@@ -130,45 +134,226 @@ jobs:
             otool -L "$dylib" | head -10
           done
 
-      - name: Prepare package
-        id: package
+      - name: Stage payload
+        id: stage
         run: |
           VERSION="${{ steps.version.outputs.display }}"
           VARIANT="${{ matrix.variant }}"
           PKG_NAME="ffmpeg-${VERSION}-macos-arm64-${VARIANT}"
+          PREFIX="${INSTALL_PREFIX}"
 
-          mkdir -p "pkg/${PKG_NAME}/lib"
-          mkdir -p "pkg/${PKG_NAME}/include"
+          # Build a payload tree that mirrors the final on-disk layout.
+          # pkgbuild --root will install everything under PREFIX at $PREFIX.
+          ROOT="payload"
+          mkdir -p "${ROOT}${PREFIX}/lib"
+          mkdir -p "${ROOT}${PREFIX}/include"
+          mkdir -p "${ROOT}${PREFIX}/share/ffmpeg-macos-arm64/${PKG_NAME}"
 
-          # Copy dylibs (versioned + symlinks)
-          cp -a install/lib/*.dylib "pkg/${PKG_NAME}/lib/"
+          # Copy dylibs (versioned files + symlinks) and headers.
+          cp -a install/lib/*.dylib "${ROOT}${PREFIX}/lib/"
+          cp -a install/include/* "${ROOT}${PREFIX}/include/"
 
-          # Copy headers
-          cp -a install/include/* "pkg/${PKG_NAME}/include/"
-
-          # Copy licence
+          # Bundle the appropriate licence text.
           if [[ "$VARIANT" == "gpl" ]]; then
-            cp ffmpeg-src/COPYING.GPLv2 "pkg/${PKG_NAME}/LICENSE.txt"
+            cp ffmpeg-src/COPYING.GPLv2 "${ROOT}${PREFIX}/share/ffmpeg-macos-arm64/${PKG_NAME}/LICENSE.txt"
           else
-            cp ffmpeg-src/COPYING.LGPLv2.1 "pkg/${PKG_NAME}/LICENSE.txt"
+            cp ffmpeg-src/COPYING.LGPLv2.1 "${ROOT}${PREFIX}/share/ffmpeg-macos-arm64/${PKG_NAME}/LICENSE.txt"
           fi
 
-          # Copy install script
-          cp install.sh "pkg/${PKG_NAME}/"
-          chmod +x "pkg/${PKG_NAME}/install.sh"
+          # Set install names / inter-library references to the FINAL absolute
+          # location so the libs resolve correctly once installed under PREFIX.
+          cd "${ROOT}${PREFIX}/lib"
+          DYLIBS=()
+          for f in *.dylib; do
+            [[ -f "$f" && ! -L "$f" ]] && DYLIBS+=("$f")
+          done
+          echo "Real dylibs: ${DYLIBS[*]}"
+          for dylib in "${DYLIBS[@]}"; do
+            install_name_tool -id "${PREFIX}/lib/$dylib" "$dylib" 2>/dev/null || true
+            while IFS= read -r line; do
+              DEP_PATH="$(echo "$line" | awk '{print $1}')"
+              DEP_NAME="$(basename "$DEP_PATH")"
+              case "$DEP_NAME" in
+                libavutil*|libavcodec*|libavformat*|libswscale*|libswresample*|libavfilter*|libavdevice*|libpostproc*)
+                  if [[ "$DEP_PATH" != "${PREFIX}/lib/$DEP_NAME" ]]; then
+                    install_name_tool -change "$DEP_PATH" "${PREFIX}/lib/$DEP_NAME" "$dylib" 2>/dev/null || true
+                  fi
+                  ;;
+              esac
+            done < <(otool -L "$dylib" | tail -n +2)
+          done
 
-          # Create tarball
-          cd pkg
-          tar -cJf "${PKG_NAME}.tar.xz" "${PKG_NAME}"
-
-          echo "archive=${PKG_NAME}.tar.xz" >> "$GITHUB_OUTPUT"
           echo "pkg_name=${PKG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "pkg_identifier=${PKG_IDENTIFIER_PREFIX}.${VARIANT}" >> "$GITHUB_OUTPUT"
+          echo "root=${ROOT}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up signing keychain
+        id: signing
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          if [[ -z "${MACOS_CERT_P12_BASE64:-}" || -z "${MACOS_CERT_PASSWORD:-}" ]]; then
+            echo "No signing certificate secrets present; will produce an UNSIGNED pkg."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+
+          # Create and unlock a dedicated temporary keychain.
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import the .p12 (expected to contain BOTH the Developer ID
+          # Application and Developer ID Installer certs + private keys).
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERT_PASSWORD" \
+            -k "$KEYCHAIN_PATH" -T /usr/bin/codesign -T /usr/bin/productsign
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          # Allow codesign/productsign to use the keys without an interactive prompt.
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+
+          # Make this keychain visible to the toolchain.
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed s/\"//g)
+          security default-keychain -s "$KEYCHAIN_PATH"
+
+          # Discover the signing identities.
+          APP_ID="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep 'Developer ID Application' | head -1 | awk -F'"' '{print $2}')"
+          INSTALLER_ID="$(security find-identity -v "$KEYCHAIN_PATH" | grep 'Developer ID Installer' | head -1 | awk -F'"' '{print $2}')"
+
+          if [[ -z "$APP_ID" || -z "$INSTALLER_ID" ]]; then
+            echo "::error::Could not find Developer ID Application and/or Developer ID Installer identities in the provided certificate."
+            security find-identity -v "$KEYCHAIN_PATH" || true
+            exit 1
+          fi
+
+          # Team ID is the 10-char code in parentheses of the identity name.
+          TEAM_ID="$(echo "$APP_ID" | sed -n 's/.*(\([A-Z0-9]\{10\}\))$/\1/p')"
+
+          echo "Found Application identity: $APP_ID"
+          echo "Found Installer identity:   $INSTALLER_ID"
+          echo "Team ID: $TEAM_ID"
+
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+          echo "keychain=$KEYCHAIN_PATH" >> "$GITHUB_OUTPUT"
+          echo "app_identity=$APP_ID" >> "$GITHUB_OUTPUT"
+          echo "installer_identity=$INSTALLER_ID" >> "$GITHUB_OUTPUT"
+          echo "team_id=$TEAM_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Sign dylibs
+        if: steps.signing.outputs.signed == 'true'
+        run: |
+          APP_ID="${{ steps.signing.outputs.app_identity }}"
+          LIB_DIR="${{ steps.stage.outputs.root }}${INSTALL_PREFIX}/lib"
+
+          # Sign the real dylib files (skip symlinks) with hardened runtime + secure timestamp.
+          for dylib in "$LIB_DIR"/*.dylib; do
+            [[ -L "$dylib" ]] && continue
+            codesign --force --timestamp --options runtime \
+              --sign "$APP_ID" "$dylib"
+          done
+
+          echo "=== Verify dylib signatures ==="
+          for dylib in "$LIB_DIR"/*.dylib; do
+            [[ -L "$dylib" ]] && continue
+            codesign --verify --strict --verbose=2 "$dylib" 2>&1 | tail -2 || true
+          done
+
+      - name: Build installer package
+        id: build_pkg
+        run: |
+          VERSION="${{ steps.version.outputs.display }}"
+          PKG_NAME="${{ steps.stage.outputs.pkg_name }}"
+          IDENTIFIER="${{ steps.stage.outputs.pkg_identifier }}"
+          ROOT="${{ steps.stage.outputs.root }}"
+
+          mkdir -p out
+
+          # Component package from the staged payload root.
+          pkgbuild \
+            --root "$ROOT" \
+            --identifier "$IDENTIFIER" \
+            --version "$VERSION" \
+            --install-location "/" \
+            "out/${PKG_NAME}-component.pkg"
+
+          # Distribution (product) package wrapping the component.
+          productbuild \
+            --identifier "$IDENTIFIER" \
+            --version "$VERSION" \
+            --package "out/${PKG_NAME}-component.pkg" \
+            "out/${PKG_NAME}-unsigned.pkg"
+
+          if [[ "${{ steps.signing.outputs.signed }}" == "true" ]]; then
+            productsign --sign "${{ steps.signing.outputs.installer_identity }}" \
+              "out/${PKG_NAME}-unsigned.pkg" "out/${PKG_NAME}.pkg"
+            echo "=== Verify pkg signature ==="
+            pkgutil --check-signature "out/${PKG_NAME}.pkg" || true
+          else
+            cp "out/${PKG_NAME}-unsigned.pkg" "out/${PKG_NAME}.pkg"
+            echo "Produced UNSIGNED pkg (no signing secrets)."
+          fi
+
+          rm -f "out/${PKG_NAME}-component.pkg" "out/${PKG_NAME}-unsigned.pkg"
+          echo "pkg_path=out/${PKG_NAME}.pkg" >> "$GITHUB_OUTPUT"
+
+      - name: Notarize and staple
+        id: notarize
+        if: steps.signing.outputs.signed == 'true'
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+        run: |
+          PKG_PATH="${{ steps.build_pkg.outputs.pkg_path }}"
+          TEAM_ID="${{ steps.signing.outputs.team_id }}"
+
+          # Prefer App Store Connect API key auth; fall back to Apple ID.
+          if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" && -n "${APPLE_API_KEY_BASE64:-}" ]]; then
+            echo "Notarizing with App Store Connect API key..."
+            KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+            echo "$APPLE_API_KEY_BASE64" | base64 --decode > "$KEY_PATH"
+            xcrun notarytool submit "$PKG_PATH" \
+              --key "$KEY_PATH" \
+              --key-id "$APPLE_API_KEY_ID" \
+              --issuer "$APPLE_API_ISSUER_ID" \
+              --wait
+            rm -f "$KEY_PATH"
+          elif [[ -n "${APPLE_ID:-}" && -n "${APPLE_ID_PASSWORD:-}" ]]; then
+            echo "Notarizing with Apple ID + app-specific password..."
+            xcrun notarytool submit "$PKG_PATH" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_ID_PASSWORD" \
+              --team-id "$TEAM_ID" \
+              --wait
+          else
+            echo "::warning::pkg is signed but no notarization credentials were provided; skipping notarization and stapling."
+            exit 0
+          fi
+
+          # Staple the notarization ticket into the pkg.
+          xcrun stapler staple "$PKG_PATH"
+          xcrun stapler validate "$PKG_PATH"
+
+          # Gatekeeper smoke test for installer packages.
+          spctl --assess --type install --verbose=2 "$PKG_PATH" || true
+
+      - name: Clean up keychain
+        if: always() && steps.signing.outputs.signed == 'true'
+        run: |
+          security delete-keychain "${{ steps.signing.outputs.keychain }}" 2>/dev/null || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.package.outputs.pkg_name }}
-          path: pkg/${{ steps.package.outputs.archive }}
+          name: ${{ steps.stage.outputs.pkg_name }}
+          path: ${{ steps.build_pkg.outputs.pkg_path }}
 
   release:
     needs: build
@@ -189,10 +374,10 @@ jobs:
         with:
           path: artifacts
 
-      - name: Collect archives
+      - name: Collect packages
         run: |
           mkdir -p release
-          find artifacts -name "*.tar.xz" -exec cp {} release/ \;
+          find artifacts -name "*.pkg" -exec cp {} release/ \;
           ls -la release/
 
       - name: Create or update release
@@ -201,7 +386,11 @@ jobs:
           tag_name: v${{ steps.version.outputs.tag }}
           name: FFmpeg ${{ steps.version.outputs.tag }} macOS ARM64
           body: |
-            Shared library (dylib) builds of FFmpeg ${{ steps.version.outputs.tag }} for macOS Apple Silicon (arm64).
+            Signed & notarized macOS installer packages (`.pkg`) of FFmpeg
+            shared libraries ${{ steps.version.outputs.tag }} for Apple Silicon (arm64).
+
+            Double-click the `.pkg` to install into `/usr/local` (dylibs in
+            `/usr/local/lib`, headers in `/usr/local/include`).
 
             ## Variants
 
@@ -216,7 +405,9 @@ jobs:
             - `libswscale.9.dylib`
             - `libswresample.6.dylib`
 
-            Install names are set to `@rpath/<lib>` for easy bundling.
+            Dylib install names are set to `/usr/local/lib/<lib>`. Packages are
+            code-signed (Developer ID) and notarized when signing secrets are
+            configured on the repository.
           files: release/*
           draft: false
           prerelease: false
